@@ -1,0 +1,186 @@
+diff --git a/src/dfi/balances.h b/src/dfi/balances.h
+index 202b1ae9d5..7c29f93a94 100644
+--- a/src/dfi/balances.h
++++ b/src/dfi/balances.h
+@@ -262,12 +262,21 @@ struct CStatsTokenBalances {
+     }
+ };
+ 
+-inline CBalances SumAllTransfers(const CAccounts &to) {
++// Summiert die Betraege aller Zielkonten.
++//
++// WICHTIG: Der Rueckgabewert von AddBalances muss geprueft werden! Bei einem
++// Ueberlauf meldet SafeAdd "overflow" und Add bricht VOR der Mutation ab -
++// die Summe bliebe dann beim ersten Betrag stehen. Ohne diese Pruefung
++// wuerde die Quelle zu wenig belastet, waehrend die Zielkonten die vollen
++// Betraege gutgeschrieben bekommen (DFI-Inflation, 03.11.2026).
++inline ResVal<CBalances> SumAllTransfers(const CAccounts &to) {
+     CBalances sum;
+     for (const auto &kv : to) {
+-        sum.AddBalances(kv.second.balances);
++        if (auto res = sum.AddBalances(kv.second.balances); !res) {
++            return res;
++        }
+     }
+-    return sum;
++    return {sum, Res::Ok()};
+ }
+ 
+ struct BalanceKey {
+diff --git a/src/dfi/consensus/accounts.cpp b/src/dfi/consensus/accounts.cpp
+index 4b06e9bb34..50488f54c7 100644
+--- a/src/dfi/consensus/accounts.cpp
++++ b/src/dfi/consensus/accounts.cpp
+@@ -31,9 +31,12 @@ Res CAccountsConsensus::operator()(const CUtxosToAccountMessage &obj) const {
+     }
+ 
+     const auto mustBeBurnt = SumAllTransfers(obj.to);
+-    if (*burnt.val != mustBeBurnt) {
++    if (!mustBeBurnt) {
++        return mustBeBurnt;
++    }
++    if (*burnt.val != *mustBeBurnt.val) {
+         return Res::Err(
+-            "transfer tokens mismatch burnt tokens: (%s) != (%s)", mustBeBurnt.ToString(), burnt.val->ToString());
++            "transfer tokens mismatch burnt tokens: (%s) != (%s)", mustBeBurnt.val->ToString(), burnt.val->ToString());
+     }
+ 
+     // transfer
+@@ -77,7 +80,11 @@ Res CAccountsConsensus::operator()(const CAccountToAccountMessage &obj) const {
+     }
+ 
+     // transfer
+-    if (auto res = SubBalanceDelShares(obj.from, SumAllTransfers(obj.to)); !res) {
++    auto mustTransfer = SumAllTransfers(obj.to);
++    if (!mustTransfer) {
++        return mustTransfer;
++    }
++    if (auto res = SubBalanceDelShares(obj.from, *mustTransfer.val); !res) {
+         return res;
+     }
+ 
+@@ -94,9 +101,15 @@ Res CAccountsConsensus::operator()(const CAnyAccountsToAccountsMessage &obj) con
+ 
+     // compare
+     const auto sumFrom = SumAllTransfers(obj.from);
++    if (!sumFrom) {
++        return sumFrom;
++    }
+     const auto sumTo = SumAllTransfers(obj.to);
++    if (!sumTo) {
++        return sumTo;
++    }
+ 
+-    if (sumFrom != sumTo) {
++    if (*sumFrom.val != *sumTo.val) {
+         return Res::Err("sum of inputs (from) != sum of outputs (to)");
+     }
+ 
+diff --git a/src/dfi/consensus/poolpairs.cpp b/src/dfi/consensus/poolpairs.cpp
+index e91882bd19..a97146c88e 100644
+--- a/src/dfi/consensus/poolpairs.cpp
++++ b/src/dfi/consensus/poolpairs.cpp
+@@ -187,7 +187,11 @@ Res CPoolPairsConsensus::operator()(const CPoolSwapMessageV2 &obj) const {
+ }
+ 
+ Res CPoolPairsConsensus::operator()(const CLiquidityMessage &obj) const {
+-    CBalances sumTx = SumAllTransfers(obj.from);
++    auto sumTxRes = SumAllTransfers(obj.from);
++    if (!sumTxRes) {
++        return sumTxRes;
++    }
++    CBalances sumTx = *sumTxRes.val;
+     if (sumTx.balances.size() != 2) {
+         return Res::Err("the pool pair requires two tokens");
+     }
+diff --git a/src/dfi/mn_rpc.cpp b/src/dfi/mn_rpc.cpp
+index 19641220db..5b5fee0380 100644
+--- a/src/dfi/mn_rpc.cpp
++++ b/src/dfi/mn_rpc.cpp
+@@ -106,7 +106,11 @@ CAccounts SelectAccountsByTargetBalances(const CAccounts &accounts,
+         }
+     }
+ 
+-    const auto selectedBalancesSum = SumAllTransfers(selectedAccountsBalances);
++    auto selectedBalancesSumRes = SumAllTransfers(selectedAccountsBalances);
++    if (!selectedBalancesSumRes) {
++        return {};
++    }
++    const auto selectedBalancesSum = *selectedBalancesSumRes.val;
+     if (selectedBalancesSum != targetBalances) {
+         // we have not enough tokens balance to transfer
+         return {};
+diff --git a/src/dfi/rpc_accounts.cpp b/src/dfi/rpc_accounts.cpp
+index cc64956f6a..ead6827d88 100644
+--- a/src/dfi/rpc_accounts.cpp
++++ b/src/dfi/rpc_accounts.cpp
+@@ -812,7 +812,11 @@ UniValue utxostoaccount(const JSONRPCRequest &request) {
+     scriptBurn << OP_RETURN;
+ 
+     // burn
+-    const auto toBurn = SumAllTransfers(msg.to);
++    auto toBurnRes = SumAllTransfers(msg.to);
++    if (!toBurnRes) {
++        throw JSONRPCError(RPC_INVALID_PARAMETER, toBurnRes.msg);
++    }
++    const auto toBurn = *toBurnRes.val;
+     if (toBurn.balances.empty()) {
+         throw JSONRPCError(RPC_INVALID_PARAMETER, "zero amounts");
+     }
+@@ -986,7 +990,11 @@ UniValue accounttoaccount(const JSONRPCRequest &request) {
+     auto ownershipCheck = gArgs.GetBoolArg("-dvmownerskipcheck", DEFAULT_DVM_OWNERSHIP_CHECK);
+     msg.to = DecodeRecipientsDefaultInternal(pwallet, request.params[1].get_obj(), ownershipCheck);
+ 
+-    if (SumAllTransfers(msg.to).balances.empty()) {
++    auto sumToRes = SumAllTransfers(msg.to);
++    if (!sumToRes) {
++        throw JSONRPCError(RPC_INVALID_PARAMETER, sumToRes.msg);
++    }
++    if (sumToRes.val->balances.empty()) {
+         throw JSONRPCError(RPC_INVALID_PARAMETER, "zero amounts");
+     }
+ 
+@@ -1099,7 +1107,11 @@ UniValue accounttoutxos(const JSONRPCRequest &request) {
+     msg.from = DecodeScript(request.params[0].get_str());
+     RejectErc55Address(msg.from);
+     const auto to = DecodeRecipients(pwallet->chain(), request.params[1]);
+-    msg.balances = SumAllTransfers(to);
++    auto sumToRes = SumAllTransfers(to);
++    if (!sumToRes) {
++        throw JSONRPCError(RPC_INVALID_PARAMETER, sumToRes.msg);
++    }
++    msg.balances = *sumToRes.val;
+     if (msg.balances.balances.empty()) {
+         throw JSONRPCError(RPC_INVALID_PARAMETER, "zero amounts");
+     }
+@@ -2126,7 +2138,11 @@ UniValue sendtokenstoaddress(const JSONRPCRequest &request) {
+     auto ownershipCheck = gArgs.GetBoolArg("-dvmownerskipcheck", DEFAULT_DVM_OWNERSHIP_CHECK);
+     msg.to = DecodeRecipientsDefaultInternal(pwallet, request.params[1].get_obj(), ownershipCheck);
+ 
+-    const CBalances sumTransfersTo = SumAllTransfers(msg.to);
++    auto sumTransfersToRes = SumAllTransfers(msg.to);
++    if (!sumTransfersToRes) {
++        throw JSONRPCError(RPC_INVALID_PARAMETER, sumTransfersToRes.msg);
++    }
++    const CBalances sumTransfersTo = *sumTransfersToRes.val;
+     if (sumTransfersTo.balances.empty()) {
+         throw JSONRPCError(RPC_INVALID_PARAMETER, "zero amounts in \"to\" param");
+     }
+diff --git a/src/dfi/rpc_customtx.cpp b/src/dfi/rpc_customtx.cpp
+index ffa0aaa31d..adbbe2daca 100644
+--- a/src/dfi/rpc_customtx.cpp
++++ b/src/dfi/rpc_customtx.cpp
+@@ -193,7 +193,12 @@ public:
+     }
+ 
+     void operator()(const CLiquidityMessage &obj) const {
+-        CBalances sumTx = SumAllTransfers(obj.from);
++        auto sumTxRes = SumAllTransfers(obj.from);
++        if (!sumTxRes) {
++            rpcInfo.pushKV("error", sumTxRes.msg);
++            return;
++        }
++        const CBalances sumTx = *sumTxRes.val;
+         if (sumTx.balances.size() == 2) {
+             auto amountA = *sumTx.balances.begin();
+             auto amountB = *(std::next(sumTx.balances.begin(), 1));
